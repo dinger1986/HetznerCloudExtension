@@ -135,10 +135,6 @@
                 @endif
             </button>
 
-            <!--<button class="button bg-red-600 hover:bg-red-700 text-white" onclick="hetzner_control('reset')">
-                Power cycle Server
-            </button>-->
-
             <button class="button button-secondary text-white" onclick="hetzner_control('reset_password')">
                 Reset root Password
             </button>
@@ -157,8 +153,7 @@
         </div>
     </div>
 </div>
-        
-   
+
 <script>
     function hetzner_control(action) {
         var xhr = new XMLHttpRequest();
