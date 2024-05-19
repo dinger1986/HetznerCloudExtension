@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Http\Request;
 use App\Models\OrderProduct;
 use App\Models\Product;
+use Exception;
 
 class HetznerCloud extends Server
 {
@@ -35,6 +36,12 @@ class HetznerCloud extends Server
             [
                 'name' => 'apiToken',
                 'friendlyName' => 'API Token',
+                'type' => 'text',
+                'required' => true,
+            ],
+            [
+                'name' => 'dnsApiToken',
+                'friendlyName' => 'DNS API Token',
                 'type' => 'text',
                 'required' => true,
             ],
@@ -68,7 +75,6 @@ class HetznerCloud extends Server
             ],
         ];
     }
-
 
     private function postRequest($url, $data): \GuzzleHttp\Promise\PromiseInterface|\Illuminate\Http\Client\Response
     {
@@ -169,18 +175,26 @@ class HetznerCloud extends Server
         $location = $configurableOptions['location'] ?? $params['location'];
         $image = $configurableOptions['image'] ?? $params['image'];
         $server_type = $params['server_type'];
-        //$hostname = "vps-".date('dmYs');
-        $default_hostname = $this->config('serverHostname').date('dmYs');
+        $default_hostname = $this->config('serverHostname') . date('dmYs');
+
         try {
             $configurableOptions['hostname']->validate([
                 'hostname' => ['required', 'string', 'max:250', 'unique:projects', 'regex:/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/'],
             ]);
             $hostname = $configurableOptions['hostname'] ?? $default_hostname;
-        }
-        catch (\Exception $e) {
+        } catch (\Exception $e) {
             $hostname = $default_hostname;
         }
-        
+
+        // Include cloud-init script
+        $cloudInitScript = '#cloud-config
+users:
+  - name: user
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    groups: sudo
+    shell: /bin/bash
+    ssh-authorized-keys:
+      - ssh-rsa AAAAB3...';
 
         $json = [
             'automount' => false,
@@ -193,6 +207,7 @@ class HetznerCloud extends Server
             ],
             'server_type' => $server_type,
             'start_after_create' => true,
+            'user_data' => base64_encode($cloudInitScript),
         ];
         $response = $this->postRequest($url, $json);
 
@@ -200,13 +215,69 @@ class HetznerCloud extends Server
             ExtensionHelper::error('HetznerCloud', 'Failed to create server for order ' . $orderProduct->id . ' with error ' . $response->body());
             return false;
         }
-        ExtensionHelper::setOrderProductConfig('server_id', $response->json()["server"]["id"], $orderProduct->id);
-        ExtensionHelper::setOrderProductConfig('server_ipv4', $response->json()["server"]["public_net"]["ipv4"]["ip"], $orderProduct->id);
-        ExtensionHelper::setOrderProductConfig('server_ipv6', $response->json()["server"]["public_net"]["ipv6"]["ip"], $orderProduct->id);
-        ExtensionHelper::setOrderProductConfig('server_root_passwd', $response->json()["root_password"], $orderProduct->id);
+
+        $server_id = $response->json()["server"]["id"];
+        $server_ipv4 = $response->json()["server"]["public_net"]["ipv4"]["ip"];
+        $server_ipv6 = $response->json()["server"]["public_net"]["ipv6"]["ip"];
+        $server_root_passwd = $response->json()["root_password"];
+
+        ExtensionHelper::setOrderProductConfig('server_id', $server_id, $orderProduct->id);
+        ExtensionHelper::setOrderProductConfig('server_ipv4', $server_ipv4, $orderProduct->id);
+        ExtensionHelper::setOrderProductConfig('server_ipv6', $server_ipv6, $orderProduct->id);
+        ExtensionHelper::setOrderProductConfig('server_root_passwd', $server_root_passwd, $orderProduct->id);
         ExtensionHelper::setOrderProductConfig('server_image', $image, $orderProduct->id);
+
+        // Set DNS record
+        $domain = $params['domain'];
+        $dnsProvider = $params['dns_provider'];
+        $apiToken = $this->config('dnsApiToken'); // You need to add this to your config
+
+        if ($dnsProvider == 'cloudflare') {
+            $zoneId = $this->getCloudflareZoneId($domain, $apiToken); // Implement this method to get the zone ID
+            $this->setCloudflareDNS($domain, $server_ipv4, $apiToken, $zoneId);
+        }
+        // Add other providers as needed...
+
         return true;
-        
+    }
+
+    private function setCloudflareDNS($domain, $ipAddress, $apiToken, $zoneId)
+    {
+        $url = "https://api.cloudflare.com/client/v4/zones/$zoneId/dns_records";
+        $data = [
+            'type' => 'A',
+            'name' => $domain,
+            'content' => $ipAddress,
+            'ttl' => 3600,
+            'proxied' => false,
+        ];
+
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $apiToken,
+            'Content-Type' => 'application/json',
+        ])->post($url, $data);
+
+        if (!$response->successful()) {
+            throw new Exception('Failed to set DNS record for domain ' . $domain . ' with error ' . $response->body());
+        }
+
+        return $response->json();
+    }
+
+    private function getCloudflareZoneId($domain, $apiToken)
+    {
+        $url = "https://api.cloudflare.com/client/v4/zones?name=$domain";
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $apiToken,
+            'Content-Type' => 'application/json',
+        ])->get($url);
+
+        if (!$response->successful()) {
+            throw new Exception('Failed to get Cloudflare zone ID for domain ' . $domain . ' with error ' . $response->body());
+        }
+
+        $zoneId = $response->json()['result'][0]['id'];
+        return $zoneId;
     }
 
     public function suspendServer($user, $params, $order, $orderProduct, $configurableOptions): bool
@@ -245,7 +316,6 @@ class HetznerCloud extends Server
         return false;
     }
 
-
     public function getCustomPages($user, $params, $order, $product, $configurableOptions)
     {
         if(!isset($params['config']['server_id'])) {
@@ -265,17 +335,7 @@ class HetznerCloud extends Server
         $disk = $status_request->json()['server']['server_type']['disk'];
         $reverse_dns = $status_request->json()['server']['public_net']['ipv4']['dns_ptr'];
 
-        // WSS Console Connection
-        //$postData = [
-            //'id' => $server_id,
-        //];
-        //$wss_status = $this->postRequest('https://api.hetzner.cloud/v1/servers/'.$server_id.'/actions/request_console', $postData);
-        //if ($wss_status->json()['action']['error'] != null) throw new Exception('Unable to get wss console for server');
-        //$wss_url = $wss_status->json()['wss_url'];
-        //$wss_password = $wss_status->json()['password'];
-        //dd($wss_status);
-
-        //Server Metrics
+        // Server Metrics
         $ctime = time(); // current time
         $start_time = strtotime('-1 hour', $ctime);
         // Format the times in ISO-8601 format
@@ -294,7 +354,6 @@ class HetznerCloud extends Server
         if (!$metrics_network_request->json()) throw new Exception('Unable to get server metrics for NETWORK');
         $metrics_network = $metrics_network_request->json()['metrics']['time_series'];
         
-
         return [
             'name' => 'info',
             'template' => 'hetznercloud::info',
@@ -309,24 +368,16 @@ class HetznerCloud extends Server
                 'memory' => $memory,
                 'disk' => $disk,
                 'reverse_dns' => $reverse_dns,
-                //'wss_url' => $wss_url,
-                //'wss_password' => $wss_password,
                 'metrics_cpu' => $metrics_cpu,
                 'metrics_disk' => $metrics_disk,
                 'metrics_network' => $metrics_network,
-
             ],
             'pages' => [
-                    [
+                [
                     'template' => 'hetznercloud::metrics',
                     'name' => 'Server Metrics',
                     'url' => 'metrics',
-                   ],
-                   //[
-                    //'template' => 'hetznercloud::console',
-                    //'name' => 'Console',
-                    //'url' => 'console',
-                   //],
+                ],
             ]
         ];
     }
@@ -349,9 +400,8 @@ class HetznerCloud extends Server
         }
 
         $status = $this->postRequest('https://api.hetzner.cloud/v1/servers/'.$server_id.'/actions/'.$request_action, $postData);
-        //dd($status->json());
         if ($status->json()['action']['error'] != null) throw new Exception('Unable to ' . $request_action . ' server');
-        //Check for a new root password with command reset_password
+        // Check for a new root password with command reset_password
         if (isset($status->json()['root_password'])) {
             ExtensionHelper::setOrderProductConfig('server_root_passwd', $status->json()["root_password"], $product->id);
         }
@@ -374,16 +424,6 @@ class HetznerCloud extends Server
         $server_ipv4 = $params['config']['server_ipv4'];
         $form_data_dns = $request->status;
 
-
-        // BETA - HAS TO BE TESTED!
-        /*foreach (['ipv4', 'ipv6'] as $ipVersion) {
-            $set_dns = $this->postRequest("https://api.hetzner.cloud/v1/servers/{$server_id}/actions/change_dns_ptr", [
-                'id' => $server_id,
-                'ip' => ($ipVersion === 'ipv4') ? $server_ipv4 : $server_ipv6,
-                'dns_ptr' => $request->reverse_dns,
-            ]);
-        }*/
-
         $postData = [
             'id' => $server_id,
             'ip' => $server_ipv4,
@@ -393,10 +433,5 @@ class HetznerCloud extends Server
         $set_dns = $this->postRequest('https://api.hetzner.cloud/v1/servers/'.$server_id.'/actions/change_dns_ptr', $postData);
         if ($set_dns->json()['action']['error'] != null) throw new Exception('Unable to change reverse dns for server');
         return redirect()->back()->with('success', 'Reverse dns entry has been updated successfully');
-        /*return response()->json([
-            'status' => 'success',
-            'message' => 'Servers reverse dns entry has been updated',
-        ]);*/
     }
-    
 }
